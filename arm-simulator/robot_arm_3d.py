@@ -1,16 +1,155 @@
 #!/usr/bin/env python3
 """
-3D Robot Arm CAD Viewer
-A 3D simulation of a robot arm with rotating base, shoulder, and elbow joints.
-Controls: Arrow keys + WAED for joint manipulation
+3D Robot Arm CAD Viewer with Real-time Pose Control
+A 3D simulation of a robot arm controlled by your left arm movements via VPU pose detection.
+Controls: Arrow keys + WAED for manual joint manipulation, or automatic pose control
 """
 
 import pygame
 import math
 import numpy as np
+import cv2
+import threading
+import time
 from pygame.locals import *
 from OpenGL.GL import *
 from OpenGL.GLU import *
+
+# Import YOLO for pose detection
+try:
+    from ultralytics import YOLO
+except ImportError:
+    print("❌ ultralytics not found. Please install: pip install ultralytics")
+    YOLO = None
+
+class PoseDetector:
+    """Real-time pose detection using YOLO11 Pose"""
+    
+    def __init__(self):
+        self.model = None
+        self.cap = None
+        self.left_shoulder_angle = 0.0
+        self.left_elbow_angle = 0.0
+        self.running = False
+        self.thread = None
+        
+        if YOLO:
+            try:
+                self.model = YOLO('yolo11n-pose.pt')
+                print("🤖 YOLO pose detection initialized")
+            except Exception as e:
+                print(f"❌ YOLO initialization failed: {e}")
+    
+    def calculate_angle(self, p1, p2, p3):
+        """Calculate angle between three points (p2 is the vertex)"""
+        v1 = np.array([p1[0] - p2[0], p1[1] - p2[1]])
+        v2 = np.array([p3[0] - p2[0], p3[1] - p2[1]])
+        
+        dot_product = np.dot(v1, v2)
+        norms = np.linalg.norm(v1) * np.linalg.norm(v2)
+        
+        if norms == 0:
+            return 0
+        
+        cos_angle = dot_product / norms
+        cos_angle = np.clip(cos_angle, -1, 1)
+        angle = np.arccos(cos_angle) * 180 / np.pi
+        
+        return angle
+    
+    def start_camera(self):
+        """Initialize camera for pose detection"""
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            print("❌ Could not open camera")
+            return False
+        
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return True
+    
+    def pose_detection_loop(self):
+        """Main pose detection loop running in separate thread"""
+        if not self.model or not self.cap:
+            return
+        
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+            
+            try:
+                # Run YOLO inference
+                results = self.model(frame, verbose=False)
+                
+                for r in results:
+                    if r.keypoints is not None and len(r.keypoints) > 0:
+                        keypoints = r.keypoints[0].xy[0].cpu().numpy()
+                        
+                        # YOLO keypoint indices for left arm
+                        left_shoulder_idx = 5
+                        left_elbow_idx = 7
+                        left_wrist_idx = 9
+                        right_shoulder_idx = 6
+                        
+                        # Check if all required keypoints are detected
+                        if (len(keypoints) > 9 and 
+                            np.sum(keypoints[left_shoulder_idx]) > 0 and
+                            np.sum(keypoints[left_elbow_idx]) > 0 and
+                            np.sum(keypoints[left_wrist_idx]) > 0 and
+                            np.sum(keypoints[right_shoulder_idx]) > 0):
+                            
+                            # Calculate left shoulder angle (left shoulder, right shoulder, left elbow)
+                            self.left_shoulder_angle = self.calculate_angle(
+                                keypoints[left_shoulder_idx],
+                                keypoints[right_shoulder_idx], 
+                                keypoints[left_elbow_idx]
+                            )
+                            
+                            # Calculate left elbow angle (left shoulder, left elbow, left wrist)
+                            self.left_elbow_angle = self.calculate_angle(
+                                keypoints[left_shoulder_idx],
+                                keypoints[left_elbow_idx],
+                                keypoints[left_wrist_idx]
+                            )
+                            
+                            # Map angles to robot arm range
+                            # Shoulder: map to -90 to 90 degrees
+                            self.left_shoulder_angle = np.clip(self.left_shoulder_angle - 90, -90, 90)
+                            # Elbow: map to -150 to 150 degrees  
+                            self.left_elbow_angle = np.clip(self.left_elbow_angle - 180, -150, 150)
+                            
+                            break
+                            
+            except Exception as e:
+                print(f"Pose detection error: {e}")
+            
+            time.sleep(0.033)  # ~30 FPS
+    
+    def start(self):
+        """Start pose detection in background thread"""
+        if not self.start_camera():
+            return False
+        
+        self.running = True
+        self.thread = threading.Thread(target=self.pose_detection_loop, daemon=True)
+        self.thread.start()
+        print("📹 Pose detection started")
+        return True
+    
+    def stop(self):
+        """Stop pose detection"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1)
+        if self.cap:
+            self.cap.release()
+        print("📹 Pose detection stopped")
+    
+    def get_angles(self):
+        """Get current left arm angles"""
+        return self.left_shoulder_angle, self.left_elbow_angle
 
 class RobotArm:
     def __init__(self):
@@ -33,6 +172,9 @@ class RobotArm:
         
         # Control sensitivity
         self.angle_step = 2.0
+        
+        # Control mode
+        self.pose_control = False
 
     def update_joint(self, joint, delta):
         """Update joint angle without limits"""
@@ -42,6 +184,11 @@ class RobotArm:
             self.shoulder_angle += delta
         elif joint == 'elbow':
             self.elbow_angle += delta
+    
+    def set_pose_angles(self, shoulder_angle, elbow_angle):
+        """Set angles directly from pose detection"""
+        self.shoulder_angle = shoulder_angle
+        self.elbow_angle = elbow_angle
 
     def get_end_effector_position(self):
         """Calculate end effector position using forward kinematics"""
@@ -76,6 +223,7 @@ class RobotArm:
 class RobotArmViewer:
     def __init__(self):
         self.robot_arm = RobotArm()
+        self.pose_detector = PoseDetector()
         self.camera_distance = 10.0
         self.camera_angle_x = 20.0
         self.camera_angle_y = 45.0
@@ -84,7 +232,7 @@ class RobotArmViewer:
         """Initialize OpenGL settings"""
         pygame.init()
         pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
-        pygame.display.set_caption("3D Robot Arm CAD Viewer")
+        pygame.display.set_caption("3D Robot Arm - Pose Controlled")
         
         # Set clear color to light gray
         glClearColor(0.2, 0.2, 0.2, 1.0)
@@ -247,29 +395,38 @@ class RobotArmViewer:
         """Handle keyboard input for joint control"""
         step = self.robot_arm.angle_step
         
-        # Arrow keys: Left/Right for base, Up/Down for shoulder
-        if keys[pygame.K_LEFT]:
-            self.robot_arm.update_joint('base', -step)
-        if keys[pygame.K_RIGHT]:
-            self.robot_arm.update_joint('base', step)
-        if keys[pygame.K_UP]:
-            self.robot_arm.update_joint('shoulder', step)
-        if keys[pygame.K_DOWN]:
-            self.robot_arm.update_joint('shoulder', -step)
-            
-        # WAED: W/E for elbow, A/D for fine base control
-        if keys[pygame.K_w]:
-            self.robot_arm.update_joint('elbow', step)
-        if keys[pygame.K_e]:
-            self.robot_arm.update_joint('elbow', -step)
-        if keys[pygame.K_a]:
-            self.robot_arm.update_joint('base', -step/2)
-        if keys[pygame.K_d]:
-            self.robot_arm.update_joint('base', step/2)
+        # Toggle pose control with P key
+        if keys[pygame.K_p]:
+            self.robot_arm.pose_control = not self.robot_arm.pose_control
+            print(f"🎮 Pose control: {'ON' if self.robot_arm.pose_control else 'OFF'}")
+            time.sleep(0.2)  # Prevent multiple toggles
+        
+        # Manual control (only when pose control is off)
+        if not self.robot_arm.pose_control:
+            # Arrow keys: Left/Right for base, Up/Down for shoulder
+            if keys[pygame.K_LEFT]:
+                self.robot_arm.update_joint('base', -step)
+            if keys[pygame.K_RIGHT]:
+                self.robot_arm.update_joint('base', step)
+            if keys[pygame.K_UP]:
+                self.robot_arm.update_joint('shoulder', step)
+            if keys[pygame.K_DOWN]:
+                self.robot_arm.update_joint('shoulder', -step)
+                
+            # WAED: W/E for elbow, A/D for fine base control
+            if keys[pygame.K_w]:
+                self.robot_arm.update_joint('elbow', step)
+            if keys[pygame.K_e]:
+                self.robot_arm.update_joint('elbow', -step)
+            if keys[pygame.K_a]:
+                self.robot_arm.update_joint('base', -step/2)
+            if keys[pygame.K_d]:
+                self.robot_arm.update_joint('base', step/2)
 
     def display_info(self):
         """Display joint angles and controls"""
-        print(f"\rBase: {self.robot_arm.base_angle:6.1f}° | "
+        mode = "POSE" if self.robot_arm.pose_control else "MANUAL"
+        print(f"\r[{mode}] Base: {self.robot_arm.base_angle:6.1f}° | "
               f"Shoulder: {self.robot_arm.shoulder_angle:6.1f}° | "
               f"Elbow: {self.robot_arm.elbow_angle:6.1f}°", end="")
 
@@ -278,14 +435,19 @@ class RobotArmViewer:
         width, height = 1200, 800
         self.init_opengl(width, height)
         
+        # Start pose detection
+        if not self.pose_detector.start():
+            print("⚠️  Pose detection failed, running in manual mode only")
+        
         clock = pygame.time.Clock()
         running = True
         
-        print("3D Robot Arm CAD Viewer")
+        print("3D Robot Arm - Pose Controlled")
         print("Controls:")
-        print("  Arrow Keys: Base rotation (Left/Right), Shoulder (Up/Down)")
-        print("  W/E: Elbow up/down")
-        print("  A/D: Fine base control")
+        print("  P: Toggle pose control ON/OFF")
+        print("  Arrow Keys: Base rotation (Left/Right), Shoulder (Up/Down) [manual mode]")
+        print("  W/E: Elbow up/down [manual mode]")
+        print("  A/D: Fine base control [manual mode]")
         print("  ESC: Exit")
         print("  Mouse: Drag to rotate camera view")
         print()
@@ -325,6 +487,11 @@ class RobotArmViewer:
             keys = pygame.key.get_pressed()
             self.handle_input(keys)
             
+            # Update robot arm with pose data if pose control is enabled
+            if self.robot_arm.pose_control:
+                shoulder_angle, elbow_angle = self.pose_detector.get_angles()
+                self.robot_arm.set_pose_angles(shoulder_angle, elbow_angle)
+            
             # Clear screen
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             
@@ -343,6 +510,7 @@ class RobotArmViewer:
             clock.tick(60)  # 60 FPS
         
         print("\nExiting...")
+        self.pose_detector.stop()
         pygame.quit()
 
 if __name__ == "__main__":
@@ -352,6 +520,6 @@ if __name__ == "__main__":
     except ImportError as e:
         print(f"Required module not found: {e}")
         print("Please install required packages:")
-        print("pip install pygame PyOpenGL PyOpenGL_accelerate numpy")
+        print("pip install pygame PyOpenGL PyOpenGL_accelerate numpy opencv-python ultralytics")
     except Exception as e:
         print(f"Error: {e}")
